@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # Both interpreters always run. With fail-fast, the first failure cancels
+      # the other job — and a digest that differs BETWEEN versions is exactly
+      # what the reproducibility check exists to catch, so cancelling the
+      # second runner hides the finding.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: pip install -e .[warehouse,dev]
+      - name: Compile every module
+        run: python -m compileall -q src tests scripts tools
+      - name: Lint
+        run: ruff check src tests scripts tools
+      - name: Sanitize gate
+        # --public-mode is explicit: a public clone has no installation-specific
+        # pattern file, and the gate refuses to run with an undeclared ruleset.
+        # The private ruleset runs upstream before every mirror push.
+        run: python tools/sanitize_gate.py --public-mode
+      - name: Unit tests
+        run: pytest -q
+      - name: Repro (deterministic forward sha)
+        # Prints the fixed-seed forward-pass sha; the 3.11 and 3.12 runners
+        # are two independent clean clones and must print identical values.
+        run: pytest -s -q tests/test_repro_determinism.py
+      - name: Training smoke (CPU)
+        # The smoke must PROVE training ran: a finite loss and a checkpoint
+        # that was written and read back. The two greps are the gate — the
+        # script must print exactly these marker lines.
+        shell: bash
+        run: |
+          python scripts/train_backbone.py --synthetic 2>&1 | tee smoke.log
+          grep -q "loss finite" smoke.log
+          grep -q "checkpoint written/reloaded" smoke.log
