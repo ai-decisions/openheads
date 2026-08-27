@@ -5,9 +5,9 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from openheads.models import (  # noqa: E402
+    MODEL_REGISTRY,
     GATClassifier,
     GraphSAGEClassifier,
-    HGTClassifier,
     create_model,
 )
 
@@ -63,20 +63,6 @@ class TestGAT:
         assert emb.shape == (20, 128)
 
 
-class TestHGT:
-    def test_forward_shape(self) -> None:
-        x, edge_index = _make_small_graph()
-        model = HGTClassifier(in_channels=169, hidden_channels=64, out_channels=3)
-        logits = model(x, edge_index)
-        assert logits.shape == (20, 3)
-
-    def test_embeddings_shape(self) -> None:
-        x, edge_index = _make_small_graph()
-        model = HGTClassifier(in_channels=169, hidden_channels=128)
-        emb = model.get_embeddings(x, edge_index)
-        assert emb.shape == (20, 128)
-
-
 class TestModelRegistry:
     def test_create_graphsage(self) -> None:
         model = create_model("graphsage", in_channels=10)
@@ -86,9 +72,13 @@ class TestModelRegistry:
         model = create_model("gat", in_channels=10)
         assert isinstance(model, GATClassifier)
 
-    def test_create_hgt(self) -> None:
-        model = create_model("hgt", in_channels=10)
-        assert isinstance(model, HGTClassifier)
+    def test_no_misnamed_architectures(self) -> None:
+        """The registry once carried "hgt" pointing at a two-layer GraphSAGE
+        placeholder. A name that promises an architecture the class does not
+        implement must never come back."""
+        assert "hgt" not in MODEL_REGISTRY
+        with pytest.raises(ValueError, match="Unknown model"):
+            create_model("hgt", in_channels=10)
 
     def test_unknown_model_raises(self) -> None:
         with pytest.raises(ValueError, match="Unknown model"):

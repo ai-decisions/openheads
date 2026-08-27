@@ -16,24 +16,27 @@ quantile and negative-sample quantile) so the reported number is never
 silently the easier of the two.
 
 Env:
-  OPENHEADS_CHAIN     chain name (required)
-  OPENHEADS_WORK_DIR  directory holding the chain's inputs (default ./runs)
-  OPENHEADS_OUT_URI   optional object-storage prefix to upload results to;
-                      unset = local output only, nothing is uploaded
-  OPENHEADS_REGION    region for the upload, required only with OUT_URI
+  OPENHEADS_CHAIN      chain name (required)
+  OPENHEADS_WORK_DIR   directory holding the chain's inputs (default ./runs)
+  OPENHEADS_LABEL_SET  label-set parquet path (default
+                       <work dir>/<chain>/label_set.parquet)
+  OPENHEADS_OUT_URI    optional S3 destination (s3 scheme, bucket + key
+                       prefix); unset = local output only, nothing uploaded
+  OPENHEADS_REGION     region for the upload, used only with OUT_URI
 """
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import time
 
 import numpy as np
 import torch
 from torch import nn
+
+from openheads.heads import build_fincrime_head
 
 CHAIN = os.environ.get("OPENHEADS_CHAIN", "")
 D = os.path.join(os.environ.get("OPENHEADS_WORK_DIR", "./runs"), CHAIN)
@@ -44,28 +47,38 @@ TOPK = 10_000
 FPRS = (0.01, 0.001, 0.0001)
 EPOCHS = 8
 BATCH = 8192
+# Below this the seeded 80/20 split leaves a held-out set too small for the
+# recall numbers this script reports to mean anything (< 20 entities).
+MIN_POSITIVES = 100
 
 
 def log(m: str) -> None:
     print(f"[{time.strftime('%H:%M:%SZ', time.gmtime())}] {m}", flush=True)
 
 
-def run(argv: list[str]) -> None:
-    """Run a command as an argv list — never through a shell.
+def upload(local_path: str, uri: str, region: str) -> None:
+    """Upload through boto3's standard credential chain.
 
-    The upload path interpolates a chain name and file names; built as a
-    string for a shell, that is a command-injection hole in a published
-    script.
+    boto3, not a shelled-out `aws` CLI: SECURITY.md promises that object
+    storage is reached through the SDK credential chain and that no external
+    binary is required — the upload path has to keep that promise too.
     """
-    subprocess.run(argv, check=True)
+    import boto3  # lazy: only the upload path needs the warehouse extra
+
+    if not uri.startswith("s3://"):
+        raise SystemExit(
+            f"OPENHEADS_OUT_URI must be an S3 URI (s3 scheme, bucket + key "
+            f"prefix), got {uri!r}"
+        )
+    bucket, _, key = uri[len("s3://"):].partition("/")
+    client = boto3.client("s3", region_name=region or None)
+    client.upload_file(local_path, bucket, key)
 
 
 def build_head() -> nn.Module:
-    return nn.Sequential(
-        nn.Linear(128, 256), nn.ReLU(), nn.Dropout(0.2),
-        nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
-        nn.Linear(128, 1),
-    )
+    # Architecture lives in openheads.heads — one source for the trainer,
+    # the pooled variant and the tau scan that loads strict=True.
+    return build_fincrime_head(dropout=0.2)
 
 
 def main() -> int:
@@ -91,7 +104,14 @@ def main() -> int:
             pos.append(int(i))
     pos = np.unique(np.array(pos, dtype=np.int64))
     log(f"labels resolved: {len(pos):,}")
-    assert len(pos) >= 100
+    if len(pos) < MIN_POSITIVES:
+        # Not an assert: `python -O` strips asserts, and a data gate that
+        # disappears under an interpreter flag is not a gate.
+        raise SystemExit(
+            f"{CHAIN}: {len(pos)} resolved labels < MIN_POSITIVES="
+            f"{MIN_POSITIVES}; the 80/20 split cannot support the reported "
+            "recall numbers"
+        )
 
     rng = np.random.default_rng(SEED)
     perm = rng.permutation(len(pos))
@@ -198,11 +218,7 @@ def main() -> int:
     if OUT_URI:
         for name in (f"top{TOPK}.json", "perchain_head_results.json",
                      f"fincrime_{CHAIN}.pt"):
-            argv = ["aws", "s3", "cp", os.path.join(D, name),
-                    f"{OUT_URI.rstrip('/')}/{name}", "--only-show-errors"]
-            if REGION:
-                argv += ["--region", REGION]
-            run(argv)
+            upload(os.path.join(D, name), f"{OUT_URI.rstrip('/')}/{name}", REGION)
         log(f"uploaded 3 artefacts to {OUT_URI}")
     log(f"PERCHAIN_HEAD_EXPORT_DONE {CHAIN}")
     return 0

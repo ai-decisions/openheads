@@ -19,7 +19,7 @@ Features per node (address):
     10. active_days        - distinct days with activity
     11. lifetime_days      - first_seen → last_seen span
     12. in_out_ratio       - in_degree / (in_degree + out_degree)
-    13. round_amount_ratio - fraction of tx with round amounts (1, 10, 100, ...)
+    13. round_amount_ratio - fraction of tx whose amount is a multiple of 0.01 ETH
     14. inter_tx_entropy   - entropy of inter-transaction time intervals
     15. balance_ratio      - (received - sent) / (received + sent + 1e-18)
 """
@@ -40,7 +40,11 @@ N_FEATURES = 16
 
 WEI_TO_ETH = 1e-18
 
-ROUND_AMOUNTS_WEI = {int(x * 1e18) for x in [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 50, 100, 500, 1000]}
+# "Round" = an exact multiple of 0.01 ETH (1e16 wei). One rule, not a set:
+# an earlier revision also carried an explicit set of landmark amounts, but
+# every element of it was itself a multiple of 1e16, so the set could never
+# change the outcome.
+ROUND_AMOUNT_STEP_WEI = int(1e16)
 
 
 def _entropy(values: list[float]) -> float:
@@ -73,7 +77,7 @@ def _inter_tx_entropy(timestamps: pd.Series) -> float:
 def _is_round_amount(value: int) -> bool:
     if value == 0:
         return False
-    return value in ROUND_AMOUNTS_WEI or (value % int(1e16) == 0)
+    return value % ROUND_AMOUNT_STEP_WEI == 0
 
 
 def load_parquet_transactions(
@@ -134,16 +138,14 @@ def compute_node_features(df: pd.DataFrame) -> tuple[dict[str, int], list[list[f
     round_out["is_round"] = round_out["value_int"].apply(_is_round_amount)
     round_ratio_out = round_out.groupby("from_addr")["is_round"].mean().rename("round_ratio_out")
 
-    # Pre-aggregate timestamps per address for entropy (avoid N² scan)
+    # Pre-aggregate timestamps per address for entropy. groupby, not a
+    # per-row python loop: entropy sorts the series itself, so gather order
+    # does not matter and the vectorised path is value-identical.
     ts_by_addr: dict[str, list] = {}
-    for _, row in df[["from_addr", "ts"]].iterrows():
-        a = row["from_addr"]
-        if a:
-            ts_by_addr.setdefault(a, []).append(row["ts"])
-    for _, row in df[["to_addr", "ts"]].iterrows():
-        a = row["to_addr"]
-        if a:
-            ts_by_addr.setdefault(a, []).append(row["ts"])
+    for col in ("from_addr", "to_addr"):
+        for addr, ts_group in df.dropna(subset=[col]).groupby(col)["ts"]:
+            if addr:
+                ts_by_addr.setdefault(addr, []).extend(ts_group.tolist())
 
     inter_entropy = {}
     for addr, timestamps in ts_by_addr.items():
@@ -187,7 +189,10 @@ def compute_node_features(df: pd.DataFrame) -> tuple[dict[str, int], list[list[f
             last_seen_out.get(addr, _ts_min),
             last_seen_in.get(addr, _ts_min),
         )
-        lifetime = max((last - first).days, 0) if first != pd.Timestamp.max else 0
+        # Compare against the tz-aware sentinel actually used as the default
+        # above: comparing a tz-aware `first` with the naive pd.Timestamp.max
+        # is always True, which made the never-seen branch unreachable.
+        lifetime = max((last - first).days, 0) if first != _ts_max else 0
 
         total_degree = tx_in + tx_out
         in_out = tx_in / total_degree if total_degree > 0 else 0.5
@@ -265,7 +270,9 @@ def build_pyg_data(
 
     y = None
     if labels and addr_to_idx:
-        y_list = [-1] * len(features)
+        from openheads.label_mapping import LABEL_UNKNOWN
+
+        y_list = [LABEL_UNKNOWN] * len(features)
         for addr, label in labels.items():
             if addr in addr_to_idx:
                 y_list[addr_to_idx[addr]] = label

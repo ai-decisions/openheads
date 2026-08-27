@@ -62,11 +62,23 @@ class TestModeSelectionFailsClosed:
 
 
 class TestDetection:
+    """Probes live in a THROWAWAY tree scanned via --root — never inside
+    src/. A probe planted in the package and cleaned in `finally` survives an
+    aborted run (Ctrl-C, OOM) and then fails every later gate run; writing
+    into src/ also breaks read-only checkouts and parallel test runs."""
+
     @pytest.fixture
     def patterns(self, tmp_path: Path) -> Path:
         f = tmp_path / "patterns.txt"
         f.write_text("test-bucket: totally-private-bucket-name\n")
         return f
+
+    @pytest.fixture
+    def tree(self, tmp_path: Path) -> Path:
+        t = tmp_path / "tree"
+        t.mkdir()
+        (t / "clean.py").write_text('GREETING = "hello"\n')
+        return t
 
     # Probe payloads are built from CHARACTER CODES. The gate scans this file
     # too, and it collapses `"a" + "b"` seams before matching, so neither a
@@ -75,69 +87,99 @@ class TestDetection:
     def _chars(*codes: int) -> str:
         return "".join(map(chr, codes))
 
-    def _with_probe(self, body: str, name: str = "_probe_gate.py"):
-        probe = _ROOT / "src" / "openheads" / name
-        probe.write_text(body, encoding="utf-8")
-        return probe
+    def test_private_literal_in_a_normal_file_is_caught(
+        self, patterns: Path, tree: Path
+    ) -> None:
+        (tree / "probe.py").write_text('x = "totally-private-bucket-name"\n')
+        r = _run("--private-patterns", str(patterns), "--root", str(tree))
+        assert r.returncode == 1, r.stdout
+        assert "private:test-bucket" in r.stdout
 
-    def test_private_literal_in_a_normal_file_is_caught(self, patterns: Path) -> None:
-        probe = self._with_probe('x = "totally-private-bucket-name"\n')
-        try:
-            r = _run("--private-patterns", str(patterns))
-            assert r.returncode == 1, r.stdout
-            assert "private:test-bucket" in r.stdout
-        finally:
-            probe.unlink()
-
-    def test_generic_patterns_are_case_insensitive(self) -> None:
+    def test_generic_patterns_are_case_insensitive(self, tree: Path) -> None:
         gcs = self._chars(71, 83, 58, 47, 47) + "bucket/x"
         home = self._chars(47, 104, 111, 109, 101, 47) + "someone/creds"
-        probe = self._with_probe(f'a = "{gcs}"\nb = "{home}"\n')
-        try:
-            r = _run("--public-mode")
-            assert r.returncode == 1, r.stdout
-            assert "gcs-uri" in r.stdout and "home-path" in r.stdout
-        finally:
-            probe.unlink()
+        (tree / "probe.py").write_text(f'a = "{gcs}"\nb = "{home}"\n')
+        r = _run("--public-mode", "--root", str(tree))
+        assert r.returncode == 1, r.stdout
+        assert "gcs-uri" in r.stdout and "home-path" in r.stdout
 
-    def test_internal_qa_note_is_caught(self) -> None:
+    def test_internal_qa_note_is_caught(self, tree: Path) -> None:
         note = self._chars(91) + self._chars(97, 100, 100, 114, 101, 115, 115) + self._chars(
             32, 98, 108, 97, 110, 107, 101, 100
         ) + " 2026-04-23: not found at cited URL]"
-        probe = self._with_probe(f'd = "{note}"\n')
-        try:
-            r = _run("--public-mode")
-            assert r.returncode == 1, r.stdout
-            assert "internal-qa-note" in r.stdout
-        finally:
-            probe.unlink()
+        (tree / "probe.py").write_text(f'd = "{note}"\n')
+        r = _run("--public-mode", "--root", str(tree))
+        assert r.returncode == 1, r.stdout
+        assert "internal-qa-note" in r.stdout
 
-    def test_iso_dates_are_not_false_positives(self) -> None:
-        probe = self._with_probe('TRAIN_END = "2024-07-01"\ndates = ["2020-01-01"]\n')
-        try:
-            r = _run("--public-mode")
-            assert r.returncode == 0, r.stdout
-        finally:
-            probe.unlink()
+    def test_iso_dates_are_not_false_positives(self, tree: Path) -> None:
+        (tree / "probe.py").write_text('TRAIN_END = "2024-07-01"\ndates = ["2020-01-01"]\n')
+        r = _run("--public-mode", "--root", str(tree))
+        assert r.returncode == 0, r.stdout
 
-    def test_undecodable_byte_does_not_hide_a_literal(self, patterns: Path) -> None:
-        probe = _ROOT / "src" / "openheads" / "_probe_bytes.py"
-        probe.write_bytes(b'x = "totally-private-bucket-name"  # caf\xe9\n')
-        try:
-            r = _run("--private-patterns", str(patterns))
-            assert r.returncode == 1, r.stdout
-        finally:
-            probe.unlink()
+    def test_undecodable_byte_does_not_hide_a_literal(
+        self, patterns: Path, tree: Path
+    ) -> None:
+        (tree / "probe.py").write_bytes(b'x = "totally-private-bucket-name"  # caf\xe9\n')
+        r = _run("--private-patterns", str(patterns), "--root", str(tree))
+        assert r.returncode == 1, r.stdout
 
-    def test_dangling_symlink_with_restricted_name_is_caught(self) -> None:
-        link = _ROOT / "src" / "openheads" / "policy.pt"
-        link.symlink_to("/nonexistent/target")
-        try:
-            r = _run("--public-mode")
-            assert r.returncode == 1, r.stdout
-            assert "restricted-data-file" in r.stdout
-        finally:
-            link.unlink()
+    def test_dangling_symlink_with_restricted_name_is_caught(self, tree: Path) -> None:
+        (tree / "policy.pt").symlink_to("/nonexistent/target")
+        r = _run("--public-mode", "--root", str(tree))
+        assert r.returncode == 1, r.stdout
+        assert "restricted-data-file" in r.stdout
+
+    def test_weight_file_flagged_by_name_not_decoded(self, tree: Path) -> None:
+        """A weight file is a violation by NAME; its bytes must not also be
+        decoded as text — that buried the verdict under home-path noise from
+        pickled payloads."""
+        home = self._chars(47, 85, 115, 101, 114, 115, 47)  # /Users/ inside bytes
+        (tree / "model.pt").write_bytes(f"garbage {home}someone".encode())
+        r = _run("--public-mode", "--root", str(tree))
+        assert r.returncode == 1, r.stdout
+        assert "restricted-data-file" in r.stdout
+        assert "home-path" not in r.stdout
+
+    def test_service_dir_with_files_fails_empty_passes(self, tree: Path) -> None:
+        """A file-bearing agent-config dir must fail a published-tree scan (a
+        flip done by COPYING a working dir would ship it); an empty
+        bookkeeping dir the harness drops everywhere is not a violation."""
+        svc = tree / ".claude"
+        svc.mkdir()
+        r = _run("--public-mode", "--root", str(tree))
+        assert r.returncode == 0, r.stdout
+        (svc / "settings.json").write_text("{}\n")
+        r = _run("--public-mode", "--root", str(tree))
+        assert r.returncode == 1, r.stdout
+        assert "service-directory" in r.stdout
+
+    def test_service_dir_nested_and_file_form_are_caught(self, tree: Path) -> None:
+        """Two bypasses a top-level-only check allowed: a service dir nested
+        below the root, and a plain FILE named like the directory."""
+        nested = tree / "src" / "x" / ".claude"
+        nested.mkdir(parents=True)
+        (nested / "settings.json").write_text("{}\n")
+        r = _run("--public-mode", "--root", str(tree))
+        assert r.returncode == 1, r.stdout
+        assert "service-directory" in r.stdout
+
+        flat = tree / "flat"
+        flat.mkdir()
+        (flat / "ok.py").write_text("x = 1\n")
+        (flat / ".claude").write_text("config-as-a-file\n")
+        r = _run("--public-mode", "--root", str(flat))
+        assert r.returncode == 1, r.stdout
+        assert "service-directory" in r.stdout
+
+    def test_empty_root_is_an_error_not_clean(self, tmp_path: Path) -> None:
+        """`clean (0 files scanned)` is how a mistyped --root reads as a
+        pass; an empty scan must refuse instead."""
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        r = _run("--public-mode", "--root", str(empty))
+        assert r.returncode == 2, r.stdout
+        assert "nothing to scan" in r.stdout
 
     def test_the_gate_itself_is_scanned_for_private_literals(self, tmp_path: Path) -> None:
         """The gate excludes itself from the generic scan — it must NOT be

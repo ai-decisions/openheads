@@ -14,10 +14,8 @@ dist/
 out/
 runs/
 models/
-# The shipped registry lives inside the package (src/openabm/data/), which the
-# rule below does not touch: a pattern containing a slash is anchored to this
-# file's directory. A repo-root data/ only ever holds local scraper artefacts,
-# so everything in it is ignored — including a stray regenerated registry.
+# A repo-root data/ only ever holds local artefacts (download_elliptic
+# writes data/raw/elliptic), never tracked content — ignore all of it.
 data/*
 .claude/
 .ruff_cache/

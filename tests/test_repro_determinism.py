@@ -126,10 +126,17 @@ def test_architecture_fingerprint_is_pinned() -> None:
 
 
 def test_forward_sha_is_reproducible_in_process() -> None:
-    first = forward_sha(_build_encoder())
-    second = forward_sha(_build_encoder())
+    # ONE encoder, TWO forward passes. Building the encoder twice reseeded
+    # the global RNG each time, so both passes replayed the same RNG tape and
+    # even active dropout produced equal digests — the assertion could not
+    # catch a lost eval(). On a single instance the second pass starts from a
+    # different RNG state, so any RNG-dependent op in the forward changes the
+    # digest and fails here.
+    encoder = _build_encoder()
+    first = forward_sha(encoder)
+    second = forward_sha(encoder)
     print(f"REPRO_SHA forward {first}")
-    assert first == second, "forward pass is not deterministic under a fixed seed"
+    assert first == second, "forward pass is not deterministic (RNG-dependent op active?)"
 
 
 def test_forward_sha_matches_pinned_reference() -> None:

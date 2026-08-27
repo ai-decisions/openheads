@@ -19,6 +19,10 @@ except ImportError:
     Data = None  # type: ignore[assignment,misc]
 
 
+# This module's OWN feature contract for small NetworkX graphs. It matches
+# no other shipped pipeline (feature_pipeline emits 16 behavioural features,
+# the Elliptic path 169): a model scoring nx_to_pyg output must have been
+# trained on nx_to_pyg output.
 N_FEATURES = 5
 
 
@@ -50,7 +54,7 @@ def nx_to_pyg(graph: nx.Graph) -> Any:
     nodes = list(graph.nodes())
     node_to_idx = {n: i for i, n in enumerate(nodes)}
 
-    # Structural features matching training data
+    # The 5 structural features of THIS module's contract (see N_FEATURES)
     degree_c = nx.degree_centrality(graph)
     k = min(100, graph.number_of_nodes())
     betweenness_c = nx.betweenness_centrality(graph, k=k)

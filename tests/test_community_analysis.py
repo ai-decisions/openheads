@@ -31,10 +31,15 @@ def _make_two_cluster_graph():
     return g
 
 
-hdbscan = pytest.importorskip("hdbscan", reason="hdbscan not installed")
-
-
 class TestClusterEmbeddings:
+    """Only THIS class calls cluster_embeddings, which needs hdbscan. The
+    skip is scoped here: a module-level importorskip silently skipped the
+    whole file — ten tests, seven of which never touch hdbscan."""
+
+    @pytest.fixture(autouse=True)
+    def _needs_hdbscan(self) -> None:
+        pytest.importorskip("hdbscan", reason="hdbscan not installed")
+
     def test_clusters_found(self, analyzer) -> None:
         """HDBSCAN finds clusters in well-separated embeddings."""
         rng = np.random.default_rng(42)

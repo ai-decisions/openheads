@@ -46,13 +46,10 @@ TEST_FRACTION = 0.10  # frozen held-out test, stratified, same seed
 ALPHA_AIAGENT = 0.3
 BETA_FINCRIME = 0.7
 
-# Head / training hyperparameters.
-LR_EPOCH1 = 1e-3
-LR_EPOCH2 = 1e-4
-BATCH_SIZE = 4096
-MAX_EPOCHS = 2
+# Dropout of the JOINT two-head module (build_model). The standalone
+# per-chain training scripts train with dropout 0.2 — that value is their
+# recipe and is passed explicitly at the call sites.
 DROPOUT = 0.3
-PLATEAU_REL_CHANGE = 0.01  # relative change in val recall@FPR that stops a run
 
 
 def setup_logging(log_dir: str = "./runs", name: str = "openheads") -> logging.Logger:
@@ -85,6 +82,40 @@ def log_json(log: logging.Logger, event: str, **kw: Any) -> None:
     log.info("JSON %s", json.dumps(payload, default=str))
 
 
+def build_fincrime_head(embed_dim: int = EMBED_DIM, dropout: float = 0.2):  # type: ignore[no-untyped-def]
+    """THE fincrime head architecture (embed_dim -> 256 -> 128 -> 1).
+
+    Single source: the training scripts, the tau scan and the joint module
+    all build the head here, so the architecture cannot drift between the
+    file that trains a checkpoint and the file that loads it strict=True.
+    Returned as a bare ``nn.Sequential`` — its state_dict keys (``0.weight``,
+    ``3.weight``, ``6.weight``) are the on-disk contract of
+    ``fincrime_<chain>.pt``.
+    """
+    import torch.nn as nn
+
+    return nn.Sequential(
+        nn.Linear(embed_dim, 256), nn.ReLU(), nn.Dropout(dropout),
+        nn.Linear(256, 128), nn.ReLU(), nn.Dropout(dropout),
+        nn.Linear(128, 1),
+    )
+
+
+def build_aiagent_head(embed_dim: int = EMBED_DIM, dropout: float = 0.0):  # type: ignore[no-untyped-def]
+    """THE narrow behavioural head (embed_dim -> 64 -> 1).
+
+    The Dropout layer is kept even at p=0.0: it occupies an index, so the
+    state_dict keys are 0/3, not 0/2 — dropping it makes strict=True loading
+    of an existing checkpoint fail with missing/unexpected keys.
+    """
+    import torch.nn as nn
+
+    return nn.Sequential(
+        nn.Linear(embed_dim, 64), nn.ReLU(), nn.Dropout(dropout),
+        nn.Linear(64, 1),
+    )
+
+
 def build_model(dropout: float = DROPOUT, embed_dim: int = EMBED_DIM):  # type: ignore[no-untyped-def]
     """Two independent heads over one shared embedding.
 
@@ -98,15 +129,8 @@ def build_model(dropout: float = DROPOUT, embed_dim: int = EMBED_DIM):  # type: 
     class TwoHeadDetector(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.aiagent = nn.Sequential(
-                nn.Linear(embed_dim, 64), nn.ReLU(), nn.Dropout(dropout),
-                nn.Linear(64, 1),
-            )
-            self.fincrime = nn.Sequential(
-                nn.Linear(embed_dim, 256), nn.ReLU(), nn.Dropout(dropout),
-                nn.Linear(256, 128), nn.ReLU(), nn.Dropout(dropout),
-                nn.Linear(128, 1),
-            )
+            self.aiagent = build_aiagent_head(embed_dim, dropout)
+            self.fincrime = build_fincrime_head(embed_dim, dropout)
 
         def forward(self, x):  # type: ignore[no-untyped-def]
             return self.aiagent(x).squeeze(-1), self.fincrime(x).squeeze(-1)

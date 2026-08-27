@@ -54,10 +54,20 @@ SELF = Path(__file__).resolve()
 # Suffixes whose CONTENT is never scanned, because they are binary by
 # definition. Everything else is read and scanned — an allow-list of "text"
 # extensions meant a literal inside .log, .ipynb, .tex or .env was invisible
-# while the file still counted as scanned.
+# while the file still counted as scanned. The weight/pickle family is here
+# too: those files are ALREADY violations by name (RESTRICTED_FILENAME), and
+# decoding megabytes of pickle as UTF-8 only buries that verdict in noise.
 BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf",
                    ".zip", ".gz", ".tar", ".whl", ".so", ".dylib", ".woff",
-                   ".woff2", ".ttf", ".mp4", ".parquet"}
+                   ".woff2", ".ttf", ".mp4", ".parquet",
+                   ".pt", ".pth", ".ckpt", ".safetensors", ".bin", ".npz",
+                   ".npy", ".pkl", ".pickle", ".joblib", ".h5", ".onnx"}
+
+# Agent/tool configuration directories. They live legitimately in a private
+# working tree (and are .gitignore'd), but a tree that CLAIMS to be the
+# publishable artefact (--public-mode) must not contain them: a flip done by
+# copying a working directory instead of `git archive` would ship them.
+SERVICE_DIRS = {".claude", ".codex", ".hoff_tmp"}
 
 CONTENT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("gcs-uri", re.compile(r"gs://", re.IGNORECASE)),
@@ -150,9 +160,9 @@ def deobfuscate(text: str) -> str:
     return _CONCAT_JOIN.sub("", text)
 
 
-def iter_files() -> list[Path]:
+def iter_files(root: Path = ROOT) -> list[Path]:
     out = []
-    for p in ROOT.rglob("*"):
+    for p in root.rglob("*"):
         if p.is_symlink():
             # A dangling symlink is not is_file(), so it would skip even the
             # restricted-filename check. Keep it in the list; the content
@@ -161,7 +171,7 @@ def iter_files() -> list[Path]:
             continue
         if not p.is_file():
             continue
-        rel = p.relative_to(ROOT)
+        rel = p.relative_to(root)
         parts = rel.parts
         # build/, dist/ and *.egg-info hold COPIES of the tree: skipping them
         # meant a literal could sit in a staged artefact and pass the gate.
@@ -186,7 +196,14 @@ def main() -> int:
         help="run the generic ruleset only; required to acknowledge that no "
         "installation-specific literals are being checked",
     )
+    ap.add_argument(
+        "--root",
+        default=None,
+        help="tree to scan (default: this repository). Lets tests gate a "
+        "fixture tree instead of planting probe files inside src/",
+    )
     args = ap.parse_args()
+    root = Path(args.root).resolve() if args.root else ROOT
 
     env_set = "SANITIZE_PRIVATE_PATTERNS" in os.environ
     if args.private_patterns is None and env_set:
@@ -213,8 +230,26 @@ def main() -> int:
         mode = "generic+private"
 
     violations: list[str] = []
-    for p in iter_files():
-        rel = p.relative_to(ROOT)
+    # A published artefact must not carry agent/tool config FILES — at ANY
+    # depth, and a plain file named like the directory counts too. Only
+    # file-bearing paths are flagged: the agent harness drops empty
+    # bookkeeping dirs into any working tree, and an empty directory ships
+    # nothing (git cannot even represent one).
+    scan_list = iter_files(root)
+    service_hits = sorted(
+        {
+            str(p.relative_to(root))
+            for p in scan_list
+            if p.name in SERVICE_DIRS or SERVICE_DIRS & set(p.relative_to(root).parts[:-1])
+        }
+    )
+    for hit in service_hits:
+        violations.append(
+            f"{hit}: service-directory (agent/tool config must not "
+            "ship in a published tree)"
+        )
+    for p in scan_list:
+        rel = p.relative_to(root)
         if RESTRICTED_FILENAME.search(p.name):
             violations.append(f"{rel}: restricted-data-file (name pattern)")
         if p.suffix.lower() in BINARY_SUFFIXES:
@@ -249,7 +284,7 @@ def main() -> int:
         # checked for the private literals it exists to keep out (the exact
         # defect that put a private inventory in this file).
         self_text = deobfuscate(SELF.read_text(encoding="utf-8", errors="replace"))
-        rel_self = SELF.relative_to(ROOT)
+        rel_self = SELF.relative_to(ROOT) if SELF.is_relative_to(ROOT) else SELF
         for name, pat in private_patterns:
             for m in pat.finditer(self_text):
                 line = self_text.count("\n", 0, m.start()) + 1
@@ -260,7 +295,11 @@ def main() -> int:
         for v in violations:
             print(" ", v)
         return 1
-    print(f"SANITIZE GATE: clean ({len(iter_files())} files scanned) [{mode}]")
+    if not scan_list:
+        # "clean (0 files scanned)" is how a mistyped --root reads as a pass.
+        print(f"SANITIZE GATE: nothing to scan under {root} — wrong --root?")
+        return 2
+    print(f"SANITIZE GATE: clean ({len(scan_list)} files scanned) [{mode}]")
     return 0
 
 

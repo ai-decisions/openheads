@@ -32,18 +32,29 @@ def test_shannon_entropy_empty_zero():
     assert _shannon_entropy([5]) == 0.0
 
 
-def test_dominant_frequency_periodic_high():
-    # Pure periodic signal — should have high dominant freq strength
-    ts = np.arange(0, 1000, 10)  # every 10s
-    score = _dominant_frequency(ts)
-    assert score >= 0.0  # not negative
-
-
-def test_dominant_frequency_random_low():
+def test_dominant_frequency_periodic_beats_random():
+    """The metric's one job: a periodic inter-arrival pattern must score
+    HIGHER than noise. (Earlier revisions asserted only `>= 0.0` /
+    `0 <= s <= 1` — bounds the function satisfies by construction, so the
+    tests could not fail.)"""
+    # Alternating 10s/20s cadence: the diff series is itself periodic, so the
+    # spectrum concentrates in one bin.
+    diffs = np.tile([10, 20], 32)
+    periodic_ts = np.concatenate([[0], np.cumsum(diffs)])
     rng = np.random.default_rng(42)
-    ts = np.sort(rng.integers(0, 100000, size=50))
-    score = _dominant_frequency(ts)
-    assert 0.0 <= score <= 1.0
+    random_ts = np.sort(rng.integers(0, 100_000, size=len(periodic_ts)))
+
+    periodic_score = _dominant_frequency(periodic_ts)
+    random_score = _dominant_frequency(random_ts)
+    assert 0.0 <= random_score <= 1.0
+    assert 0.0 <= periodic_score <= 1.0
+    assert periodic_score > random_score
+
+
+def test_dominant_frequency_constant_cadence_is_degenerate_zero():
+    # A perfectly constant interval has zero variance: there is no spectrum
+    # to analyse and the function defines the answer as 0.0.
+    assert _dominant_frequency(np.arange(0, 1000, 10)) == 0.0
 
 
 def test_dominant_frequency_short_signal_zero():
@@ -98,13 +109,15 @@ def test_compute_returns_correct_shape(agent_like_df):
 
 
 def test_agent_more_regular_than_human(agent_like_df, human_like_df):
-    """Agent should have lower time entropy than human (more regular)."""
+    """Agent must have LOWER time entropy than human — that direction is the
+    feature's meaning, and `!=` (the earlier assertion) passes even with the
+    semantics inverted."""
     agent_map, agent_feats = compute_ai_agent_features(agent_like_df)
     human_map, human_feats = compute_ai_agent_features(human_like_df)
     ai = agent_map["0xagent"]
     hi = human_map["0xhuman"]
-    # Feature 0: tx_time_entropy — lower for agent is ideal, but even different is enough
-    assert agent_feats[ai, 0] != human_feats[hi, 0]
+    # Feature 0: tx_time_entropy
+    assert agent_feats[ai, 0] < human_feats[hi, 0]
 
 
 def test_agent_has_identical_amounts(agent_like_df):
@@ -131,8 +144,10 @@ def test_normalize_features_range():
 def test_normalize_handles_zero_variance():
     features = np.ones((10, N_AI_AGENT_FEATURES))
     normalized = normalize_features(features)
-    # Should not raise, should return zeros
-    assert not np.any(np.isnan(normalized))
+    # Zero-variance columns must map to EXACT zeros (x - min over a unit
+    # range), not merely avoid NaN — the earlier NaN-only assertion accepted
+    # any garbage value.
+    assert np.array_equal(normalized, np.zeros_like(normalized))
 
 
 def test_combine_features_shape():

@@ -6,8 +6,10 @@ GraphSAGE encoder with per-chain normalisation over a multi-chain
 transaction graph, small MLP scoring heads on the shared embedding, a
 warm-start training recipe, and decision thresholds calibrated as exact
 population quantiles of the score distribution. In production the method
-runs on a five-EVM-chain graph of 835,330,427 addresses and 15,826,261,934
-edges. This repository is the **method**, not the data or the result.
+runs on a five-chain graph — four EVM chains plus Tron, whose address
+space is base58check, not EVM (`openheads.tron_address` exists precisely
+for that) — of 835,330,427 addresses and 15,826,261,934 edges. This
+repository is the **method**, not the data or the result.
 
 ## Boundary — what is open here, and what is not
 
@@ -47,6 +49,20 @@ edges. This repository is the **method**, not the data or the result.
 - **A synthetic training smoke** (`openheads.synthetic`,
   `scripts/train_backbone.py --synthetic`): trains on an in-memory
   synthetic graph — no data, no object storage, no GPU.
+- **Supporting modules** (all shipped, all in the box):
+  `openheads.ai_agent_features` — the 20 behavioural features for
+  agent-like activity detection; `openheads.address_case` — the chain-aware
+  address case policy (base58check case is payload; a blanket lowercase
+  destroys it); `openheads.tron_address` — Tron base58check ↔ hex
+  conversion; `openheads.bridge` — a small NetworkX→PyG converter with its
+  own 5-feature contract for toy graphs; `openheads.community_analysis` —
+  HDBSCAN clustering over embeddings plus `generate_gnn_brief`, a
+  prompt-text generator for downstream summarisation (the LLM itself is
+  not part of this repository); `openheads.inference` — `GNNScorer`, a
+  local utility that loads a checkpoint this repo trains and scores a
+  graph with it. `GNNScorer` is **not** the production serving stack: what
+  serves customers (APIs, stores, thresholds, infrastructure) stays
+  closed; what lets you score your own checkpoint locally is here.
 
 **Not open (deliberately):**
 
@@ -103,7 +119,9 @@ This trains the real architecture on an in-memory synthetic graph: no
 data, no credentials, no GPU. The run prints `loss finite` and
 `checkpoint written/reloaded`; CI gates on exactly those lines.
 
-Runnable entry points. Two take command-line flags; the other three are
+Runnable entry points — they live in `scripts/` and run **from a clone of
+this repository**; the installed wheel ships the `openheads` library only,
+with no console commands. Two take command-line flags; the other three are
 configured entirely through `OPENHEADS_*` environment variables and print
 the list of variables they need when one is missing (see each module's
 docstring):

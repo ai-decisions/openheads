@@ -29,6 +29,8 @@ from pathlib import Path
 
 import structlog
 
+from openheads.address_case import canonical_case
+
 logger = structlog.get_logger(__name__)
 
 LABEL_LICIT = 0
@@ -93,15 +95,22 @@ def load_known_labels(entity_csv_path: str | Path) -> dict[str, int]:
 
 
 def merge_labels(*label_dicts: dict[str, int]) -> dict[str, int]:
+    """Merge label dicts; on conflict, illicit wins.
+
+    Keys are normalised through `canonical_case`, NOT a blanket `.lower()`:
+    base58check addresses (BTC legacy, Tron, ...) carry their case as payload
+    and lowercasing destroys them — `address_case` states that as a MUST for
+    every ingest path, and this is an ingest path.
+    """
     merged: dict[str, int] = {}
     for d in label_dicts:
         for addr, label in d.items():
-            addr_lower = addr.lower()
-            if addr_lower in merged and merged[addr_lower] != label:
+            key = canonical_case(addr)
+            if key in merged and merged[key] != label:
                 # illicit takes priority over licit
-                merged[addr_lower] = LABEL_ILLICIT
+                merged[key] = LABEL_ILLICIT
             else:
-                merged[addr_lower] = label
+                merged[key] = label
     logger.info("merged_labels", total=len(merged))
     return merged
 
@@ -120,8 +129,10 @@ def propagate_labels_1hop(
     scores: dict[str, float] = {}
 
     for src, dst in edges:
-        src_l = src.lower()
-        dst_l = dst.lower()
+        # canonical_case, not .lower(): edges may carry base58check
+        # addresses, whose case is payload (see address_case).
+        src_l = canonical_case(src)
+        dst_l = canonical_case(dst)
         if src_l in illicit_addrs and dst_l not in labels:
             scores[dst_l] = max(scores.get(dst_l, 0.0), suspicious_score)
         if dst_l in illicit_addrs and src_l not in labels:

@@ -44,6 +44,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from openheads.heads import build_fincrime_head
+
 CHAIN = os.environ.get("OPENHEADS_CHAIN", "")
 EMB_POOL = os.environ.get("OPENHEADS_POOL_EMB", "")
 POOL_NODES = os.environ.get("OPENHEADS_POOL_NODES", "")
@@ -73,6 +75,9 @@ FPRS = (0.01, 0.001, 0.0001)
 EPOCHS = 1 if SMOKE else 8
 BATCH = 8192
 SMOKE_NEG = 20_000
+# Below this the seeded 80/20 split leaves a held-out set too small for the
+# recall numbers this script reports to mean anything (< 20 entities).
+MIN_POSITIVES = 100
 
 
 def log(m: str) -> None:
@@ -80,11 +85,9 @@ def log(m: str) -> None:
 
 
 def build_head() -> nn.Module:
-    return nn.Sequential(
-        nn.Linear(128, 256), nn.ReLU(), nn.Dropout(0.2),
-        nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
-        nn.Linear(128, 1),
-    )
+    # Architecture lives in openheads.heads — one source for the trainer,
+    # the full-population variant and the tau scan that loads strict=True.
+    return build_fincrime_head(dropout=0.2)
 
 
 def tau_population_est(s_pos: np.ndarray, s_neg_ev: np.ndarray,
@@ -137,10 +140,19 @@ def main() -> int:
     neg_rows = in_chain[y_f[in_chain] == 0]
     log(f"{CHAIN}: chain nodes {n_chain:,}; pool rows {len(in_chain):,} "
         f"(pos {len(pos_rows):,} neg {len(neg_rows):,})")
-    assert len(pos_rows) >= 100
+    if len(pos_rows) < MIN_POSITIVES:
+        # Not an assert: `python -O` strips asserts, and a data gate that
+        # disappears under an interpreter flag is not a gate.
+        raise SystemExit(
+            f"{CHAIN}: {len(pos_rows)} positive rows < MIN_POSITIVES="
+            f"{MIN_POSITIVES}; the 80/20 split cannot support the reported "
+            "recall numbers"
+        )
 
     rng = np.random.default_rng(SEED)
-    perm = rng.permutation(len(pos_rows))          # FIRST rng draw, as upstream
+    # FIRST rng draw — the draw order is part of the recipe: it must match
+    # the full-population variant so the same entities land in held-out.
+    perm = rng.permutation(len(pos_rows))
     k = max(1, int(len(pos_rows) * 0.2))
     held, train_pos = pos_rows[perm[:k]], pos_rows[perm[k:]]
 

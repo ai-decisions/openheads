@@ -32,9 +32,9 @@ classifiers = [
 ]
 # Every entry below is imported at module level by a shipped module, so a
 # bare `pip install openheads` has to carry it. The list was derived by
-# grepping the actual imports of the shipped tree, not by intent: the
-# previous wave shipped a dependency list that made the documented install
-# command fail on import.
+# grepping the actual imports of the shipped tree, not by intent: a
+# dependency list written from memory is how a documented install command
+# ends up failing on the first import.
 #   numpy, torch       - everywhere
 #   torch_geometric    - models.py (SAGEConv/GATConv), data_prep, bridge, trainer
 #   structlog          - logging in every module

@@ -46,7 +46,13 @@ class GNNScorer:
         # Which class index carries P(illicit). The label space is a property
         # of the checkpoint: Elliptic-convention checkpoints put illicit at 0;
         # a checkpoint trained with another convention must pass its index
-        # explicitly.
+        # explicitly. Only {0, 1} are valid — licit/illicit occupy those two
+        # slots and `licit = 1 - illicit` below relies on it; index 2 (the
+        # unknown class) would silently read the wrong column.
+        if illicit_class_index not in (0, 1):
+            raise ValueError(
+                f"illicit_class_index must be 0 or 1, got {illicit_class_index}"
+            )
         self.illicit_class_index = illicit_class_index
 
         state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
@@ -60,9 +66,14 @@ class GNNScorer:
                 )
             out_channels = state_dict["classifier.weight"].shape[0]
 
-        # Auto-detect hidden_channels from first conv layer
-        if "convs.0.lin_l.weight" in state_dict:
-            hidden_channels = state_dict["convs.0.lin_l.weight"].shape[0]
+        # Auto-detect hidden_channels from the first BatchNorm: every registry
+        # architecture carries bn1 = BatchNorm1d(hidden_channels), so its
+        # weight length IS the hidden width regardless of conv type. (An
+        # earlier revision probed "convs.0.lin_l.weight" — a key none of the
+        # registry models produce, so the branch never fired and a non-default
+        # width surfaced as a raw torch size-mismatch error.)
+        if "bn1.weight" in state_dict:
+            hidden_channels = state_dict["bn1.weight"].shape[0]
 
         self.model = create_model(
             model_name,
@@ -71,7 +82,15 @@ class GNNScorer:
             out_channels=out_channels,
             **model_kwargs,
         )
-        self.model.load_state_dict(state_dict)
+        try:
+            self.model.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"checkpoint does not fit a {model_name!r} model with "
+                f"in_channels={in_channels}, hidden_channels={hidden_channels}, "
+                f"out_channels={out_channels}; pass the constructor arguments "
+                f"the checkpoint was trained with ({exc})"
+            ) from exc
         self.model.eval()
         self.out_channels = out_channels
         logger.info(

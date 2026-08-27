@@ -15,14 +15,21 @@ other silently shifts the alert count.
 Chain routing matters: a head trained on one chain does not transfer, so
 serving must route per chain to honour the measured numbers.
 
-Env (all required, no defaults):
-  OPENHEADS_CHUNKS_DIR  directory of scored embedding chunks
-  OPENHEADS_HEADS_DIR   directory of head state_dicts
-  OPENHEADS_TAU_OUT     output json path
+Env — required (fail-closed in _check_env, no defaults):
+  OPENHEADS_CHUNKS_DIR    directory of scored embedding chunks
+  OPENHEADS_HEADS_DIR     directory of head state_dicts
   OPENHEADS_CHAIN_STARTS  comma-separated node-id offsets, one per chain
-  OPENHEADS_N_TOTAL     total node count
-  OPENHEADS_TAIL_START  optional: ids >= this belong to the tail chain
-  OPENHEADS_CHAINS      optional: comma-separated chain names
+  OPENHEADS_N_TOTAL       total node count
+  OPENHEADS_CHAINS        comma-separated chain names, same order and length
+                          as the offsets
+Env — optional:
+  OPENHEADS_TAU_OUT        output json path (default ./runs/tau.json)
+  OPENHEADS_TAIL_START     ids >= this belong to the tail chain
+  OPENHEADS_TAIL_CHAIN     chain index the tail rows are routed to (default 0)
+  OPENHEADS_AI_AGENT_CHAIN chain index scored by the optional second head
+  OPENHEADS_SHARED_HEADS   "borrower=owner[,..]" pairs, e.g. "1=0": chain 1
+                           is scored by chain 0's head (chains trained
+                           together share one file)
 Heads dir layout (bare nn.Sequential state_dicts):
   fincrime_<chain>.pt, and optionally ai_agent_<chain>.pt
 """
@@ -37,14 +44,18 @@ import numpy as np
 import torch
 from torch import nn
 
-# Read at import, validated in main(): importing this module must not raise,
-# or `--help` and every test collection would die on an unset variable. The
-# fail-closed check lives in _check_env(), one call before any work starts.
+from openheads.heads import build_aiagent_head, build_fincrime_head
+
+# Env is read at import time so every knob sits in one visible block; nothing
+# is validated here — the fail-closed check lives in _check_env(), one call
+# before any work starts, and names every missing variable at once instead of
+# dying on the first attribute some later line happens to touch.
 REQUIRED_ENV = (
     "OPENHEADS_CHUNKS_DIR",
     "OPENHEADS_HEADS_DIR",
     "OPENHEADS_CHAIN_STARTS",
     "OPENHEADS_N_TOTAL",
+    "OPENHEADS_CHAINS",
 )
 CHUNKS = os.environ.get("OPENHEADS_CHUNKS_DIR", "")
 HEADS = os.environ.get("OPENHEADS_HEADS_DIR", "")
@@ -57,7 +68,9 @@ N_TOTAL = int(os.environ.get("OPENHEADS_N_TOTAL", "0"))
 # chain's head. Unset = plain partition lookup.
 _TAIL = os.environ.get("OPENHEADS_TAIL_START", "")
 TAIL_START = int(_TAIL) if _TAIL else None
-CHAINS = os.environ.get("OPENHEADS_CHAINS", "chain0,chain1").split(",")
+TAIL_CHAIN = int(os.environ.get("OPENHEADS_TAIL_CHAIN", "0"))
+CHAINS = os.environ.get("OPENHEADS_CHAINS", "").split(",") if os.environ.get(
+    "OPENHEADS_CHAINS") else []
 FPRS = (0.01, 0.001, 0.0001)
 BATCH = 262_144
 
@@ -71,25 +84,28 @@ def _check_env() -> None:
             + ", ".join(missing)
             + " (see this module's docstring)"
         )
+    if len(CHAINS) != len(STARTS):
+        # A silent mismatch here surfaces hours later as a KeyError in the
+        # middle of the population pass, after the heads are already loaded.
+        raise SystemExit(
+            f"OPENHEADS_CHAINS has {len(CHAINS)} names but "
+            f"OPENHEADS_CHAIN_STARTS has {len(STARTS)} offsets"
+        )
+    if TAIL_START is not None and not 0 <= TAIL_CHAIN < len(STARTS):
+        raise SystemExit(
+            f"OPENHEADS_TAIL_CHAIN={TAIL_CHAIN} is out of range for "
+            f"{len(STARTS)} chains"
+        )
 
 
 def log(m: str) -> None:
     print(f"[{time.strftime('%H:%M:%SZ', time.gmtime())}] {m}", flush=True)
 
 
-def fincrime_arch() -> nn.Module:
-    return nn.Sequential(
-        nn.Linear(128, 256), nn.ReLU(), nn.Dropout(0.2),
-        nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
-        nn.Linear(128, 1))
-
-
-def aiagent_arch() -> nn.Module:
-    # Dropout is kept as a layer even at p=0.0: it occupies an index, so the
-    # state_dict keys are 0/3, not 0/2. Dropping it here makes strict=True
-    # loading of an existing checkpoint fail with missing/unexpected keys.
-    return nn.Sequential(
-        nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.0), nn.Linear(64, 1))
+# Architectures live in openheads.heads — one source for the scripts that
+# train the checkpoints and this scan that loads them strict=True.
+fincrime_arch = build_fincrime_head
+aiagent_arch = build_aiagent_head
 
 
 def load_head(build, path: str, dev: str) -> nn.Module:
@@ -101,7 +117,7 @@ def load_head(build, path: str, dev: str) -> nn.Module:
 
 def chain_of(idx: int) -> int:
     if TAIL_START is not None and idx >= TAIL_START:
-        return 0                      # appended tail rows -> first chain head
+        return TAIL_CHAIN             # appended tail rows -> tail chain's head
     for ci in range(len(STARTS) - 1, -1, -1):
         if idx >= STARTS[ci]:
             return ci
@@ -130,7 +146,7 @@ def main() -> int:
     seg_ends = STARTS[1:] + [TAIL_START if TAIL_START is not None else N_TOTAL]
     expected = [seg_ends[i] - STARTS[i] for i in range(len(STARTS))]
     if TAIL_START is not None:
-        expected[0] += N_TOTAL - TAIL_START
+        expected[TAIL_CHAIN] += N_TOTAL - TAIL_START
     # One fincrime head per chain: <HEADS>/fincrime_<chain>.pt. Chains that
     # were trained together share one file — declare that with
     # OPENHEADS_SHARED_HEADS="1=0" (chain 1 is scored by chain 0's head).

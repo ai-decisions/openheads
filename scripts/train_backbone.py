@@ -32,8 +32,11 @@ Env for a real run (all paths, no defaults that point anywhere private):
   OPENHEADS_OUT_DIR      output directory (default ./runs/backbone)
   OPENHEADS_CHAIN_STARTS comma-separated node-id offsets, one per chain
   OPENHEADS_TAIL_START   optional: first id of the appended tail
+  OPENHEADS_TAIL_CHAIN   chain index the tail rows are routed to (default 0)
   OPENHEADS_N_NODES      node count of the merged graph
   OPENHEADS_INPUT_PINS   optional json {name: sha256} to verify inputs against
+  OPENHEADS_HEAD_TAG     name tag of the per-head export files (default "all")
+  OPENHEADS_MARKER_DIR   where SUCCESS/FAIL marker files go (default tempdir)
 """
 from __future__ import annotations
 
@@ -44,6 +47,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+from openheads.heads import EMBED_DIM
 
 # ---------------------------------------------------------------------------
 # RECIPE CONSTANTS — carried verbatim between runs; do not tune casually.
@@ -57,6 +62,9 @@ MAX_EPOCHS = 3
 INFER_BATCH = 4096
 PLATEAU_DEGRADE_MARGIN = 0.01
 HEARTBEAT_EVERY_N_BATCHES = 50
+# The encoder's hidden width IS the embedding width the heads consume, so it
+# reads from the single source next to the heads instead of a repeated 128.
+HIDDEN_CHANNELS = EMBED_DIM
 
 SMOKE = os.environ.get("OPENHEADS_SMOKE") == "1"
 SMOKE_POS_CAP = 2_000
@@ -71,6 +79,7 @@ _STARTS_RAW = os.environ.get("OPENHEADS_CHAIN_STARTS", "")
 CHAIN_STARTS = [int(v) for v in _STARTS_RAW.split(",")] if _STARTS_RAW else [0]
 _TAIL = os.environ.get("OPENHEADS_TAIL_START", "")
 TAIL_START = int(_TAIL) if _TAIL else None
+TAIL_CHAIN = int(os.environ.get("OPENHEADS_TAIL_CHAIN", "0"))
 N_NODES = int(os.environ.get("OPENHEADS_N_NODES", "0"))
 
 # Optional integrity pins for the inputs: {"features": "<sha256>", ...}.
@@ -307,13 +316,14 @@ def _seed_global_ids(batch):  # type: ignore[no-untyped-def]
 
 def infer_embeddings(model, graph, node_idx_np, device, log, *,
                      fanout=FANOUT):  # type: ignore[no-untyped-def]
-    """Upstream infer_embeddings with n_id passed to the encoder (edit #1)."""
+    """Embedding pass over seed nodes. `n_id` goes to the encoder because
+    chain routing is by MERGED-graph id — local batch rows carry no chain."""
     import numpy as np
     import torch
 
     from openheads.graph_batching import batch_adj
 
-    out = np.empty((len(node_idx_np), 128), dtype=np.float16)
+    out = np.empty((len(node_idx_np), EMBED_DIM), dtype=np.float16)
     loader = make_loader(graph, node_idx_np, INFER_BATCH, fanout, shuffle=False)
     model.eval()
     cursor = 0
@@ -368,7 +378,7 @@ def train_full(model, graph, needed, y_fincrime, y_aiagent,
 
     bce_a = nn.BCEWithLogitsLoss(pos_weight=_pw(ya_fit))
     bce_f = nn.BCEWithLogitsLoss(pos_weight=_pw(yf_fit))
-    log.info("[%s] plain BCE loss (stage-4 default)", label)
+    log.info("[%s] plain pos-weighted BCE loss (no focal reweighting)", label)
 
     opt = torch.optim.Adam([
         {"params": model.backbone.parameters(), "lr": LR_BACKBONE},
@@ -432,15 +442,14 @@ def train_full(model, graph, needed, y_fincrime, y_aiagent,
         emb_vp = infer_embeddings(model, graph, val_fpos_node, device, log)
         emb_vn = infer_embeddings(model, graph, val_fneg_node, device, log)
         with torch.no_grad():
-            import numpy as _np
             sp = torch.sigmoid(model.heads.fincrime(
                 torch.from_numpy(emb_vp.astype("float32")).to(device)
             ).squeeze(-1)).cpu().numpy()
             sn = torch.sigmoid(model.heads.fincrime(
                 torch.from_numpy(emb_vn.astype("float32")).to(device)
             ).squeeze(-1)).cpu().numpy()
-            y_val = _np.concatenate([_np.ones(len(sp)), _np.zeros(len(sn))]).astype("int8")
-            s_val = _np.concatenate([sp, sn])
+            y_val = np.concatenate([np.ones(len(sp)), np.zeros(len(sn))]).astype("int8")
+            s_val = np.concatenate([sp, sn])
         val_recall = recall_at_fpr(y_val, s_val, 0.001)
         val_trajectory.append(round(float(val_recall), 4))
 
@@ -487,7 +496,9 @@ def load_pool_labels(log):  # type: ignore[no-untyped-def]
 
 
 def stratified_split(needed, y_fincrime, y_aiagent, log):  # type: ignore[no-untyped-def]
-    """Seed-42 stratified test/val/fit — verbatim upstream (contract recipe)."""
+    """Seed-42 stratified test/val/fit. The seed and the draw order are part
+    of the recipe: change either and the split — and every number reported
+    against it — stops being comparable with earlier runs."""
     import numpy as np
 
     from openheads.heads import RANDOM_SEED, TEST_FRACTION
@@ -569,7 +580,10 @@ def run(log) -> int:  # type: ignore[no-untyped-def]
     started = time.time()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device != "cuda" and not SMOKE:
-        raise RuntimeError("CUDA not available — full run refuses CPU (upstream stance)")
+        raise RuntimeError(
+            "CUDA not available — a full pass on CPU takes days and its "
+            "numbers would not match a GPU recipe run; use --synthetic or "
+            "OPENHEADS_SMOKE=1 for CPU-sized checks")
     log.info("=== backbone retrain begin (device=%s smoke=%s tail_start=%s) ===",
              device, SMOKE, TAIL_START)
 
@@ -608,9 +622,9 @@ def run(log) -> int:  # type: ignore[no-untyped-def]
 
     # Encoder: full strict warm-start, appended tail routed to its own chain.
     encoder = PerChainNormEncoder(in_channels=int(x.shape[1]),
-                                  hidden_channels=128,
+                                  hidden_channels=HIDDEN_CHANNELS,
                                   chain_starts=CHAIN_STARTS,
-                                  tail_start=TAIL_START, tail_chain=0)
+                                  tail_start=TAIL_START, tail_chain=TAIL_CHAIN)
     encoder = full_warm_load(encoder, WARM_CKPT, log)
     log.info("encoder FULL warm-start from %s; heads fresh", WARM_CKPT)
     encoder.train()
@@ -663,9 +677,10 @@ def run(log) -> int:  # type: ignore[no-untyped-def]
 
     # Reload gate: the saved encoder must load strict into a fresh instance
     # built with the SAME tail routing.
-    probe = PerChainNormEncoder(in_channels=int(x.shape[1]), hidden_channels=128,
+    probe = PerChainNormEncoder(in_channels=int(x.shape[1]),
+                                hidden_channels=HIDDEN_CHANNELS,
                                 chain_starts=CHAIN_STARTS,
-                                tail_start=TAIL_START, tail_chain=0)
+                                tail_start=TAIL_START, tail_chain=TAIL_CHAIN)
     probe.load_state_dict(torch.load(enc_path, map_location="cpu", weights_only=True), strict=True)
     log.info("checkpoint reload gate PASS (strict=True)")
 
@@ -680,8 +695,9 @@ def run(log) -> int:  # type: ignore[no-untyped-def]
                        "sha256": pins["warm_ckpt"]},
         "input_pins": pins,
         "chain_starts": CHAIN_STARTS,
-        "tail_routing": {"tail_start": TAIL_START, "tail_chain": 0,
-                         "meaning": "appended tail rows -> first chain norm"},
+        "tail_routing": {"tail_start": encoder.tail_start,
+                         "tail_chain": encoder.tail_chain,
+                         "meaning": "appended tail rows -> that chain's norm"},
         "val_recall_trajectory_fpr001": val_traj,
         "test_split_leakfree_recall_fpr001": round(test_recall, 4),
         "note": ("per-chain evaluation numbers are produced by the emit and "
@@ -702,8 +718,6 @@ def run_synthetic(log) -> int:  # type: ignore[no-untyped-def]
     """Laptop wiring smoke: tiny random graph, no staged inputs, no pins.
     Exercises: encoder warm-ish init, n_id forward, train_full loop, infer,
     save/reload gate. Asserts backbone receives gradient and loss is finite."""
-    import tempfile
-
     import numpy as np
     import torch
     from torch_geometric.data import Data
@@ -711,7 +725,7 @@ def run_synthetic(log) -> int:  # type: ignore[no-untyped-def]
     from openheads.heads import build_model
     from openheads.models import PerChainNormEncoder
 
-    global OUT_DIR, BATCH_SIZE, INFER_BATCH
+    global BATCH_SIZE, INFER_BATCH
 
     n, ch = 5_000, 22
     rng = np.random.default_rng(0)
@@ -724,7 +738,7 @@ def run_synthetic(log) -> int:  # type: ignore[no-untyped-def]
     graph.num_nodes = n
 
     starts = [0, n // 2]
-    encoder = PerChainNormEncoder(in_channels=ch, hidden_channels=128,
+    encoder = PerChainNormEncoder(in_channels=ch, hidden_channels=HIDDEN_CHANNELS,
                                   chain_starts=starts)
     tmp = Path(tempfile.mkdtemp(prefix="openheads_syn_"))
     warm = tmp / "warm.pt"
@@ -734,11 +748,11 @@ def run_synthetic(log) -> int:  # type: ignore[no-untyped-def]
     # must route tail ids to tail_chain and leave every pre-tail id alone;
     # (2) an encoder warm-loaded FULL from a no-tail checkpoint must be
     # BIT-IDENTICAL on pre-tail rows (the state_dict carries no routing).
-    enc_nt = PerChainNormEncoder(in_channels=ch, hidden_channels=128,
+    enc_nt = PerChainNormEncoder(in_channels=ch, hidden_channels=HIDDEN_CHANNELS,
                                  chain_starts=[0, n // 2])
     w_nt = tmp / "w_nt.pt"
     torch.save(enc_nt.state_dict(), w_nt)
-    enc_t = PerChainNormEncoder(in_channels=ch, hidden_channels=128,
+    enc_t = PerChainNormEncoder(in_channels=ch, hidden_channels=HIDDEN_CHANNELS,
                                 chain_starts=[0, n // 2],
                                 tail_start=n, tail_chain=0)
     enc_t = full_warm_load(enc_t, w_nt, log)
@@ -771,7 +785,7 @@ def run_synthetic(log) -> int:  # type: ignore[no-untyped-def]
 
     grp, fit_rows, val_rows, test_rows = stratified_split(needed, y_f, y_a, log)
 
-    enc2 = PerChainNormEncoder(in_channels=ch, hidden_channels=128,
+    enc2 = PerChainNormEncoder(in_channels=ch, hidden_channels=HIDDEN_CHANNELS,
                                chain_starts=starts)
     enc2.load_state_dict(torch.load(warm, map_location="cpu", weights_only=True), strict=True)
     model = build_full_model(enc2, build_model())
@@ -799,7 +813,7 @@ def run_synthetic(log) -> int:  # type: ignore[no-untyped-def]
     torch.save(model.backbone.state_dict(), enc_path)
     if not enc_path.is_file() or enc_path.stat().st_size == 0:
         raise RuntimeError(f"checkpoint was not written: {enc_path}")
-    probe = PerChainNormEncoder(in_channels=ch, hidden_channels=128,
+    probe = PerChainNormEncoder(in_channels=ch, hidden_channels=HIDDEN_CHANNELS,
                                 chain_starts=starts)
     reloaded = torch.load(enc_path, map_location="cpu", weights_only=True)
     probe.load_state_dict(reloaded, strict=True)

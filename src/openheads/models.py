@@ -1,4 +1,5 @@
-"""GNN Model Architectures — GraphSAGE, GAT, HGT for node classification."""
+"""GNN model architectures — GraphSAGE and GAT classifiers, plus the
+per-chain-LayerNorm encoder used by the backbone scripts."""
 
 import structlog
 import torch
@@ -97,47 +98,6 @@ class GATClassifier(nn.Module):
         x = self.conv3(x, edge_index)
         x = self.bn3(x)
         x = f.elu(x)
-        return x
-
-
-class HGTClassifier(nn.Module):
-    """Simplified HGT placeholder — single-type graph, same interface.
-
-    Full heterogeneous support (multi-type nodes/edges) planned for a future
-    release. Currently uses SAGEConv layers as backbone with the same API.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_channels: int = 256,
-        out_channels: int = 3,
-        dropout: float = 0.3,
-    ) -> None:
-        super().__init__()
-        self.conv1 = SAGEConv(in_channels, hidden_channels)
-        self.conv2 = SAGEConv(hidden_channels, hidden_channels)
-        self.bn1 = nn.BatchNorm1d(hidden_channels)
-        self.bn2 = nn.BatchNorm1d(hidden_channels)
-        self.classifier = nn.Linear(hidden_channels, out_channels)
-        self.dropout = dropout
-
-    def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
-        x = self._encode(x, edge_index)
-        return self.classifier(x)
-
-    def get_embeddings(self, x: Tensor, edge_index: Tensor) -> Tensor:
-        return self._encode(x, edge_index)
-
-    def _encode(self, x: Tensor, edge_index: Tensor) -> Tensor:
-        x = self.conv1(x, edge_index)
-        x = self.bn1(x)
-        x = f.relu(x)
-        x = f.dropout(x, p=self.dropout, training=self.training)
-
-        x = self.conv2(x, edge_index)
-        x = self.bn2(x)
-        x = f.relu(x)
         return x
 
 
@@ -248,10 +208,13 @@ class PerChainNormEncoder(nn.Module):
         return out
 
 
+# Only architectures that ARE what their name says. An earlier revision
+# registered "hgt" pointing at a two-layer GraphSAGE placeholder — a class
+# named after an architecture it does not implement is exactly the kind of
+# thing a reviewer of a published method repo catches first.
 MODEL_REGISTRY: dict[str, type[nn.Module]] = {
     "graphsage": GraphSAGEClassifier,
     "gat": GATClassifier,
-    "hgt": HGTClassifier,
 }
 
 

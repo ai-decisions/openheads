@@ -78,23 +78,6 @@ def canonical_case(addr: str) -> str:
     return a
 
 
-def is_case_sensitive_form(addr: str, chain: str | None = None) -> bool:
-    """True when *addr* sits on a case-SENSITIVE (base58check-family) alphabet:
-    not EVM-form, not bech32-form, and — when *chain* is given — on a chain in
-    :data:`CASE_SENSITIVE_CHAINS`.
-
-    These are exactly the addresses whose payload a blanket ``.lower()`` would
-    destroy, so this is the denominator for an artefact case-integrity audit:
-    :func:`is_case_destroyed` (all-lowercase-with-letters) is the numerator.
-    """
-    a = addr.strip()
-    if not a or _EVM_RE.fullmatch(a) or _is_bech32_form(a):
-        return False
-    if chain is not None and chain.strip().lower() not in CASE_SENSITIVE_CHAINS:
-        return False
-    return True
-
-
 def is_case_destroyed(addr: str, chain: str | None = None) -> bool:
     """True when *addr* bears the destroyed-case signature: an address on a
     case-sensitive alphabet that contains letters and none of them uppercase.

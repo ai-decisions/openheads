@@ -16,12 +16,19 @@ AI DECISIONS platform (aidecisions.ai) go to the same address.
   optional warehouse extra (`pyarrow`, with `boto3` for credentials) reads training inputs
   from object storage **you configure**; configuration is fail-closed —
   no default bucket, prefix or region ships anywhere in this tree.
-- The only outbound network call this code makes on its own is the
-  user-invoked download of the **public** Elliptic benchmark dataset over
-  HTTPS (`openheads.download_elliptic`). No telemetry, no callbacks.
-- No credentials ship with the repo. AWS access, if you use the warehouse
-  extra, goes through pyarrow's S3FileSystem and the standard AWS
-  credential chain — this repository never reads a credential itself.
+- Outbound network calls, complete list, all user-invoked: the download of
+  the **public** Elliptic benchmark dataset over HTTPS
+  (`openheads.download_elliptic`); the optional upload of head-export
+  artefacts to an S3 destination **you configure** via `OPENHEADS_OUT_URI`
+  (`scripts/export_perchain_head.py`; unset = nothing is uploaded); and the
+  label-set builder's object-storage writes under `--execute` to the
+  destination **you configure** (`scripts/build_label_set.py`; the default
+  is a dry run that writes nothing). No telemetry, no callbacks.
+- No credentials ship with the repo, and no external CLI is required. AWS
+  access, if you use the warehouse extra, goes through pyarrow's
+  S3FileSystem for reads and boto3 for the optional upload — both on the
+  standard AWS credential chain; this repository never reads a credential
+  itself.
 - The repository ships **no data, no label set, no model weights, and no
   threshold values** (see `README.md` → Boundary).
 - Checkpoints are loaded with `torch.load(weights_only=True)`, which

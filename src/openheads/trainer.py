@@ -59,8 +59,12 @@ class GNNLightningModule(pl.LightningModule):
         mask = (
             batch.train_mask
             if hasattr(batch, "train_mask")
-            else torch.ones(batch.num_nodes, dtype=torch.bool)
+            else torch.ones(batch.num_nodes, dtype=torch.bool, device=batch.y.device)
         )
+        # y == -1 marks unlabelled nodes (feature_pipeline.build_pyg_data
+        # ships them that way); cross_entropy and bincount both blow up on a
+        # negative target, so the loss only ever sees labelled rows.
+        mask = mask & (batch.y >= 0)
         loss = f.cross_entropy(logits[mask], batch.y[mask], weight=self.class_weights)
         probs = f.softmax(logits[mask], dim=1)
         self.train_auroc.update(probs, batch.y[mask])
@@ -76,8 +80,9 @@ class GNNLightningModule(pl.LightningModule):
         mask = (
             batch.val_mask
             if hasattr(batch, "val_mask")
-            else torch.ones(batch.num_nodes, dtype=torch.bool)
+            else torch.ones(batch.num_nodes, dtype=torch.bool, device=batch.y.device)
         )
+        mask = mask & (batch.y >= 0)  # never score unlabelled (-1) rows
         loss = f.cross_entropy(logits[mask], batch.y[mask])
         probs = f.softmax(logits[mask], dim=1)
         self.val_auroc.update(probs, batch.y[mask])
@@ -117,9 +122,19 @@ class TrainingOrchestrator:
         dropout: float = 0.3,
         accelerator: str = "auto",
     ) -> dict[str, Any]:
-        """Train a GNN model locally. Returns metrics dict."""
+        """Train a GNN model locally. Returns metrics dict.
+
+        Accepts `feature_pipeline.build_pyg_data` output directly: unlabelled
+        nodes arrive as y == -1 and are excluded everywhere, and when the Data
+        carries no train/val masks a seeded 80/20 split over the LABELLED
+        nodes is derived here — the two shipped stages compose without an
+        undocumented manual step in between.
+        """
         in_channels = data.x.shape[1]
-        num_classes = int(data.y.max().item()) + 1
+        labelled = data.y >= 0
+        if not bool(labelled.any()):
+            raise ValueError("data.y carries no labelled nodes (every y is -1)")
+        num_classes = int(data.y[labelled].max().item()) + 1
 
         model = create_model(
             model_name,
@@ -129,8 +144,34 @@ class TrainingOrchestrator:
             dropout=dropout,
         )
 
-        # Compute class weights from training labels
-        train_labels = data.y[data.train_mask]
+        has_train = getattr(data, "train_mask", None) is not None
+        has_val = getattr(data, "val_mask", None) is not None
+        if has_train != has_val:
+            # Deriving over a half-supplied pair would silently overwrite the
+            # caller's mask; the mismatch is theirs to resolve.
+            raise ValueError(
+                "data carries only one of train_mask/val_mask — supply both "
+                "or neither (masks are derived only when both are absent)"
+            )
+        if not has_train:
+            labelled_idx = labelled.nonzero(as_tuple=True)[0]
+            if len(labelled_idx) < 2:
+                raise ValueError(
+                    f"{len(labelled_idx)} labelled node(s) cannot support a "
+                    "train/val split — at least 2 are required"
+                )
+            gen = torch.Generator().manual_seed(42)
+            perm = labelled_idx[torch.randperm(len(labelled_idx), generator=gen)]
+            n_val = max(1, int(len(perm) * 0.2))
+            val_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+            train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+            val_mask[perm[:n_val]] = True
+            train_mask[perm[n_val:]] = True
+            data.train_mask, data.val_mask = train_mask, val_mask
+
+        # Compute class weights from LABELLED training rows only — bincount
+        # raises on the -1 sentinel, and a user-supplied mask may include it.
+        train_labels = data.y[data.train_mask & labelled]
         class_counts = torch.bincount(train_labels, minlength=num_classes).float()
         class_counts = class_counts.clamp(min=1)
         class_weights = (1.0 / class_counts) / (1.0 / class_counts).sum() * num_classes
