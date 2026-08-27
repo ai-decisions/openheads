@@ -191,3 +191,74 @@ class TestDetection:
         r = _run("--private-patterns", str(f))
         assert r.returncode == 1, r.stdout
         assert "tools/sanitize_gate.py" in r.stdout
+
+
+class TestOverridesEnforcement:
+    """The overrides file is the one file the generic scan does not read, so
+    the loader itself must refuse anything but ASCII literal data — enforced,
+    not assumed. Probes run a COPY of the gate with a planted overrides file
+    so the repository's own tools/ stays untouched."""
+
+    def _gate_copy(self, tmp_path: Path, overrides: str) -> Path:
+        import shutil
+
+        toolbox = tmp_path / "gatecopy" / "tools"
+        toolbox.mkdir(parents=True)
+        gate = toolbox / "sanitize_gate.py"
+        shutil.copyfile(_GATE, gate)
+        (toolbox / "sanitize_overrides.py").write_text(overrides)
+        return gate
+
+    def _run_copy(self, gate: Path, *args: str) -> subprocess.CompletedProcess:
+        import os
+
+        env = dict(os.environ)
+        env.pop("SANITIZE_PRIVATE_PATTERNS", None)
+        return subprocess.run(
+            [sys.executable, str(gate), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    @pytest.fixture
+    def clean_tree(self, tmp_path: Path) -> Path:
+        t = tmp_path / "clean_tree"
+        t.mkdir()
+        (t / "ok.py").write_text('GREETING = "hello"\n')
+        return t
+
+    def test_executable_overrides_fail_closed(self, tmp_path: Path, clean_tree: Path) -> None:
+        gate = self._gate_copy(tmp_path, "import os\nDISABLED_PATTERNS = set()\n")
+        r = self._run_copy(gate, "--public-mode", "--root", str(clean_tree))
+        assert r.returncode == 2, r.stdout
+        assert "overrides rejected" in r.stdout
+
+    def test_non_literal_value_fails_closed(self, tmp_path: Path, clean_tree: Path) -> None:
+        gate = self._gate_copy(tmp_path, "DISABLED_PATTERNS = set([x for x in []])\n")
+        r = self._run_copy(gate, "--public-mode", "--root", str(clean_tree))
+        assert r.returncode == 2, r.stdout
+        assert "not a literal" in r.stdout
+
+    def test_secret_class_patterns_cannot_be_disabled(
+        self, tmp_path: Path, clean_tree: Path
+    ) -> None:
+        gate = self._gate_copy(tmp_path, 'DISABLED_PATTERNS = {"secret-literal"}\n')
+        r = self._run_copy(gate, "--public-mode", "--root", str(clean_tree))
+        assert r.returncode == 2, r.stdout
+        assert "cannot be overridden" in r.stdout
+
+    def test_non_ascii_overrides_fail_closed(self, tmp_path: Path, clean_tree: Path) -> None:
+        dash = chr(8212)
+        gate = self._gate_copy(tmp_path, f'"""doc {dash} note."""\nDISABLED_PATTERNS = set()\n')
+        r = self._run_copy(gate, "--public-mode", "--root", str(clean_tree))
+        assert r.returncode == 2, r.stdout
+        assert "non-ASCII" in r.stdout
+
+    def test_valid_literal_overrides_are_announced(
+        self, tmp_path: Path, clean_tree: Path
+    ) -> None:
+        gate = self._gate_copy(tmp_path, 'DISABLED_PATTERNS = {"sprint-marker"}\n')
+        r = self._run_copy(gate, "--public-mode", "--root", str(clean_tree))
+        assert r.returncode == 0, r.stdout
+        assert "repo overrides active" in r.stdout
